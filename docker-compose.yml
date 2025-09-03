@@ -1,0 +1,42 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  api:
+    build: ./services/api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:app@db:5432/appdb
+      APP_MASTER_KEY_HEX: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+      ALLOW_ORIGINS: "http://localhost:3000"
+      STORAGE_DIR: /data
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    volumes:
+      - api_data:/data
+
+  ui:
+    build: ./ui
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE: "http://localhost:8000"
+    depends_on:
+      - api
+
+volumes:
+  db_data:
+  api_data:
