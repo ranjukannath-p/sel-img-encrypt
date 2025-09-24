@@ -1,3 +1,4 @@
+import logging
 from typing import List
 from pydantic import BaseModel
 class DecryptRequest(BaseModel):
@@ -5,7 +6,7 @@ class DecryptRequest(BaseModel):
 import io, os, json, uuid, binascii, base64
 from datetime import datetime
 from typing import List, Dict, Any
-from fastapi import APIRouter, UploadFile, File, HTTPException, Header, Response
+from fastapi import APIRouter, UploadFile, File, HTTPException, Header, Response, logger
 from fastapi.responses import StreamingResponse
 from PIL import Image
 from sqlalchemy.orm import Session
@@ -16,21 +17,36 @@ from ..models import Image as ImageModel, Region as RegionModel, Audit as AuditM
 from ..settings import settings
 from ..utils.crypto import load_master_key, encrypt_bytes, decrypt_bytes, sha256_hex
 from ..utils.redact import redact_with_boxes
+from ..utils.pii_detection import detect_pii
+import numpy as np
 
 router = APIRouter(prefix="", tags=["images"])
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("images.py")
 
-def detect_regions_stub(img: Image.Image) -> List[Dict[str, Any]]:
-    """Return a couple of demo boxes for PoC skeleton.
-    Boxes are rectangles represented as 4-point polygons.
-    """
-    w, h = img.size
-    # two boxes: a central rectangle and a bottom-right small rectangle
-    box1 = [[int(0.25*w), int(0.25*h)], [int(0.75*w), int(0.25*h)], [int(0.75*w), int(0.40*h)], [int(0.25*w), int(0.40*h)]]
-    box2 = [[int(0.60*w), int(0.70*h)], [int(0.90*w), int(0.70*h)], [int(0.90*w), int(0.85*h)], [int(0.60*w), int(0.85*h)]]
-    return [
-        {"type": "ACCOUNT_NUMBER", "polygon": box1, "confidence": 0.93},
-        {"type": "FACE", "polygon": box2, "confidence": 0.98},
-    ]
+def custom_serializer(obj):
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+# Replace the detect_regions_stub function with AI-based detection logic
+def detect_regions(img: Image.Image) -> List[Dict[str, Any]]:
+    """Detect PII regions using AI-based detection logic."""
+    # Save the image temporarily to pass its path to the detection logic
+    temp_path = "temp_image.png"
+    img.save(temp_path)
+
+    # Use the detect_pii function to detect text and face regions
+    regions = detect_pii(temp_path)
+
+    # Clean up the temporary file
+    os.remove(temp_path)
+
+    return regions
 
 def save_audit(db: Session, *, actor: str, action: str, image_id: str, region_id: str | None, purpose: str | None = None):
     audit = AuditModel(
@@ -61,7 +77,7 @@ async def ingest_image(file: UploadFile = File(...)):
     os.makedirs(reg_dir, exist_ok=True)
 
     # Detect regions (stub)
-    regions = detect_regions_stub(img)
+    regions = detect_regions(img)
 
     # Redact
     boxes = [r["polygon"] for r in regions]
@@ -108,7 +124,7 @@ async def ingest_image(file: UploadFile = File(...)):
                 id=str(uuid.uuid4()),
                 image_id=image_id,
                 type=r["type"],
-                polygon_json=json.dumps(r["polygon"]),
+                polygon_json=json.dumps(r["polygon"],default=custom_serializer),
                 confidence=float(r["confidence"]),
                 sha256=sha256_hex(patch_bytes),
                 enc_algo="AES-GCM",
@@ -178,6 +194,8 @@ def get_redacted(image_id: str):
 
 @router.post("/images/{image_id}/decrypt")
 def decrypt_regions(image_id: str, req: DecryptRequest, x_role: str | None = Header(None)):
+    logger.info(f"Received payload: {req}")
+    logger.info(f"Received x-role header: {x_role}")
     if x_role != "Reviewer":
         raise HTTPException(status_code=403, detail="Reviewer role required")
 
@@ -232,9 +250,6 @@ def decrypt_regions(image_id: str, req: DecryptRequest, x_role: str | None = Hea
             if not os.path.exists(blob_path):
                 blob_path = os.path.join(reg_dir, f"{image_id}_{r.id}.bin")
 
-            # (In practice, the file saved path is f"{image_id}_r{idx}.bin".
-            #  Since r.id is exactly "r{idx}", this resolves correctly.)
-
             with open(blob_path, "rb") as f:
                 ct = f.read()
             iv = bytes.fromhex(r.iv_hex)
@@ -245,5 +260,8 @@ def decrypt_regions(image_id: str, req: DecryptRequest, x_role: str | None = Hea
             save_audit(db, actor="reviewer", action="DECRYPT", image_id=image_id, region_id=r.id, purpose="PoC demo")
 
         return out
+    except Exception as e:
+        logger.error("An error occurred in decrypt_regions", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred")
     finally:
         db.close()

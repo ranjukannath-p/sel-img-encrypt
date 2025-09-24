@@ -7,3 +7,6 @@ psycopg2-binary==2.9.9
 python-multipart==0.0.9
 Pillow==10.3.0
 cryptography==42.0.7
+easyocr
+mediapipe
+opencv-python
